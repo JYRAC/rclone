@@ -1,0 +1,15 @@
+services:
+ - type: web
+   name: rclone-directus
+   runtime: docker
+   dockerfilePath: ./Dockerfile
+   plan: free
+   envVars:
+     - key: RCLONE_CONFIG_GDRIVE_TYPE
+       value: "drive"
+     - key: RCLONE_CONFIG_GDRIVE_SCOPE
+       value: "drive"
+     - key: RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID
+       value: "1JKruQklTVP1PhvMjguoUBM89BWxzBHWP"
+     - key: RCLONE_LOG_LEVEL
+       value: "DEBUG"
