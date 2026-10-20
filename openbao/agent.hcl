@@ -31,7 +31,11 @@ env_template "RCLONE_S3_SECRET_KEY" {
   contents = "{{ with secret \"kv/data/secrets/shared/rclone-gdrive\" }}{{ .Data.data.secret_key }}{{ end }}"
 }
 
+env_template "RCLONE_AUTH_KEY" {
+  contents = "{{ with secret \"kv/data/secrets/shared/rclone-gdrive\" }}{{ .Data.data.access_key }},{{ .Data.data.secret_key }}{{ end }}"
+}
+
 exec {
-  command                   = ["/bin/sh", "-c", "exec rclone serve s3 gdrive: --addr \":10000\" --poll-interval 0 --auth-key \"${RCLONE_S3_ACCESS_KEY},${RCLONE_S3_SECRET_KEY}\""]
+  command = ["/bin/sh", "-c", "exec rclone serve s3 gdrive: --addr \":10000\" --poll-interval 0"]
   restart_on_secret_changes = "always"
 }
