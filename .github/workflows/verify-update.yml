@@ -1,0 +1,151 @@
+name: Verify and merge dependency update
+
+# Renovate が作った更新PRを、候補としてデプロイして検証する。
+#   合格 → PRをマージ(mainは常に「検証済み」だけになる)
+#   不合格 → mainのコミットで再デプロイして元に戻し、PRを閉じる
+# dry_run=true の間は、候補の検出と内容の検査だけを行い、何も変えない。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = 検出と検査だけ(デプロイもマージもしない)"
+        type: boolean
+        default: true
+      pr:
+        description: "PR番号(空なら最も古いRenovateのPR)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: verify-update
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_RCLONE_SERVICE_ID }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PR_INPUT: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          REPO=JYRAC/rclone
+          API=https://api.github.com
+          SITE=https://rclone.jyrac.stki.org/
+          DRY_RUN="${DRY_RUN:-true}"
+          H=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+
+          gh_api() { curl -sf "${H[@]}" "$@"; }
+          comment() {
+            gh_api -X POST "$API/repos/$REPO/issues/$PR/comments" \
+              -d "$(jq -n --arg b "$1" '{body:$b}')" >/dev/null || true
+          }
+
+          # --- 1. 候補のPRを選ぶ ---
+          if [ -n "${PR_INPUT:-}" ]; then
+            PR="$PR_INPUT"
+          else
+            PR=$(gh_api "$API/repos/$REPO/pulls?state=open&per_page=50&sort=created&direction=asc" \
+              | jq -r '[.[] | select(.user.login=="renovate[bot]" and (.head.ref|startswith("renovate/")))][0].number // empty')
+          fi
+          if [ -z "$PR" ]; then echo "no candidate PR"; exit 0; fi
+
+          PRJ=$(gh_api "$API/repos/$REPO/pulls/$PR")
+          AUTHOR=$(jq -r .user.login <<<"$PRJ")
+          HEAD=$(jq -r .head.sha <<<"$PRJ")
+          HEADREPO=$(jq -r .head.repo.full_name <<<"$PRJ")
+          TITLE=$(jq -r .title <<<"$PRJ")
+          echo "candidate: #$PR $TITLE ($HEAD)"
+
+          # --- 2. 安全確認: Renovate本人の、同一リポジトリのブランチで、Dockerfileの FROM / ARG BAO_VERSION 行だけの変更 ---
+          if [ "$AUTHOR" != "renovate[bot]" ] || [ "$HEADREPO" != "$REPO" ]; then
+            echo "::error::PR #$PR is not from renovate[bot] in this repo; refusing"; exit 1
+          fi
+          FILES=$(gh_api "$API/repos/$REPO/pulls/$PR/files?per_page=100")
+          if [ "$(jq 'length' <<<"$FILES")" != "1" ] || [ "$(jq -r '.[0].filename' <<<"$FILES")" != "Dockerfile" ]; then
+            echo "::error::PR #$PR changes files other than Dockerfile; refusing"; exit 1
+          fi
+          BAD=$(jq -r '.[0].patch // ""' <<<"$FILES" \
+            | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' \
+            | grep -vE '^[+-](FROM |ARG BAO_VERSION=)' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::PR #$PR changes lines other than FROM / ARG BAO_VERSION; refusing"; exit 1
+          fi
+
+          {
+            echo "### Candidate"
+            echo "- PR #$PR: $TITLE"
+            echo "- commit: \`$HEAD\`"
+            echo '```diff'
+            jq -r '.[0].patch' <<<"$FILES"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run: checks passed, nothing deployed or merged"; exit 0
+          fi
+
+          # --- 3. 候補をデプロイして検証 ---
+          BASE=$(gh_api "$API/repos/$REPO/commits/main" | jq -r .sha)
+
+          deploy_commit() { # sha
+            gh_api -X POST "$API/repos/$REPO/actions/workflows/deploy-secrets.yml/dispatches" \
+              -d "$(jq -n --arg c "$1" '{ref:"main",inputs:{commit:$c,wrap_ttl:"600s"}}')"
+          }
+
+          wait_live() { # sha t0 -> 0: live / 1: failed or timeout (10分)
+            local sha="$1" t0="$2" end=$(( $(date +%s) + 600 )) st=""
+            while [ "$(date +%s)" -lt "$end" ]; do
+              sleep 20
+              st=$(curl -sf -H "Authorization: Bearer $RENDER_API_KEY" \
+                "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys?limit=10" \
+                | jq -r --arg c "$sha" --arg t "$t0" \
+                  '[.[] | (.deploy // .) | select(.commit.id==$c and .createdAt>=$t)] | sort_by(.createdAt) | last | .status // empty') || st=""
+              echo "deploy status: ${st:-pending}"
+              case "$st" in
+                live) return 0 ;;
+                build_failed|update_failed|canceled|pre_deploy_failed|deactivated) return 1 ;;
+              esac
+            done
+            return 1
+          }
+
+          healthy() { # 30秒おきに最大8回、4回連続で 000/5xx 以外なら合格(最大4分)
+            local ok=0 i code
+            for i in 1 2 3 4 5 6 7 8; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$SITE") || code=000
+              if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then ok=$((ok+1)); else ok=0; fi
+              echo "health: HTTP $code (consecutive ok: $ok)"
+              if [ "$ok" -ge 4 ]; then return 0; fi
+              sleep 30
+            done
+            return 1
+          }
+
+          T0=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)
+          deploy_commit "$HEAD"
+          if wait_live "$HEAD" "$T0" && healthy; then
+            gh_api -X PUT "$API/repos/$REPO/pulls/$PR/merge" -d '{"merge_method":"squash"}' >/dev/null
+            comment "検証に合格したのでマージしました。デプロイしたコミット: $HEAD"
+            echo "update merged"; exit 0
+          fi
+
+          # --- 4. 不合格: mainのコミットで元に戻す ---
+          echo "::warning::candidate failed; rolling back to $BASE"
+          T1=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)
+          deploy_commit "$BASE"
+          wait_live "$BASE" "$T1" || echo "::error::rollback deploy did not become live - check Render"
+          comment "検証に失敗したため、main($BASE)に戻してこのPRを閉じました。"
+          gh_api -X PATCH "$API/repos/$REPO/pulls/$PR" -d '{"state":"closed"}' >/dev/null || true
+          echo "::error::update '$TITLE' failed and was rolled back"
+          exit 1
