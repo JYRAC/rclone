@@ -16,6 +16,10 @@ on:
         description: "PR番号(空なら最も古いRenovateのPR)"
         type: string
         default: ""
+      simulate_failure:
+        description: "true = 候補のデプロイ後に検証を強制的に不合格にする(元に戻す流れの確認用)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -37,6 +41,7 @@ jobs:
           RENDER_SERVICE_ID: ${{ secrets.RENDER_RCLONE_SERVICE_ID }}
           DRY_RUN: ${{ inputs.dry_run }}
           PR_INPUT: ${{ inputs.pr }}
+          SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
         run: |
           set -euo pipefail
           REPO=JYRAC/rclone
@@ -134,7 +139,8 @@ jobs:
 
           T0=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)
           deploy_commit "$HEAD"
-          if wait_live "$HEAD" "$T0" && healthy; then
+          SIM="${SIMULATE_FAILURE:-false}"
+          if wait_live "$HEAD" "$T0" && healthy && [ "$SIM" != "true" ]; then
             gh_api -X PUT "$API/repos/$REPO/pulls/$PR/merge" -d '{"merge_method":"squash"}' >/dev/null
             comment "検証に合格したのでマージしました。デプロイしたコミット: $HEAD"
             echo "update merged"; exit 0
@@ -145,7 +151,8 @@ jobs:
           T1=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)
           deploy_commit "$BASE"
           wait_live "$BASE" "$T1" || echo "::error::rollback deploy did not become live - check Render"
-          comment "検証に失敗したため、main($BASE)に戻してこのPRを閉じました。"
+          if [ "$SIM" = "true" ]; then NOTE="(simulate_failure による確認用の不合格です)"; else NOTE=""; fi
+          comment "検証に失敗したため、main($BASE)に戻してこのPRを閉じました。$NOTE"
           gh_api -X PATCH "$API/repos/$REPO/pulls/$PR" -d '{"state":"closed"}' >/dev/null || true
           echo "::error::update '$TITLE' failed and was rolled back"
           exit 1
