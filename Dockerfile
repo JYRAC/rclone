@@ -1,6 +1,6 @@
 FROM rclone/rclone:1.75
 
-ARG BAO_VERSION=2.7.0
+ARG BAO_VERSION=2.7.1
 RUN apk add --no-cache curl && \
     curl -fsSL -o /tmp/bao.tar.gz \
       "https://github.com/openbao/openbao/releases/download/v${BAO_VERSION}/openbao_${BAO_VERSION}_linux_amd64.tar.gz" && \
