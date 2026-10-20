@@ -32,7 +32,7 @@ env_template "RCLONE_S3_SECRET_KEY" {
 }
 
 env_template "RCLONE_AUTH_KEY" {
-  contents = "{{ with secret \"kv/data/secrets/shared/rclone-gdrive\" }}{{ .Data.data.access_key }},{{ .Data.data.secret_key }}{{ end }}"
+  contents = "\"{{ with secret \"kv/data/secrets/shared/rclone-gdrive\" }}{{ .Data.data.access_key }},{{ .Data.data.secret_key }}{{ end }}\""
 }
 
 exec {
