@@ -53,5 +53,6 @@
       ],
       "minimumReleaseAge": "1 day"
     }
-  ]
+  ],
+  "rebaseWhen": "behind-base-branch"
 }

@@ -87,6 +87,12 @@ jobs:
             echo "::error::PR #$PR changes lines other than FROM / ARG BAO_VERSION; refusing"; exit 1
           fi
 
+          # --- 2b. mainに追いついているか(古い土台のままデプロイしない。追いついていなければ、Renovateのrebaseを待つ) ---
+          BEHIND=$(gh_api "$API/repos/$REPO/compare/main...$HEAD" | jq -r '.behind_by // empty') || BEHIND=""
+          if [ "$BEHIND" != "0" ]; then
+            echo "waiting: PR #$PR is ${BEHIND:-?} commit(s) behind main; waiting for Renovate to rebase"; exit 0
+          fi
+
           {
             echo "### Candidate"
             echo "- PR #$PR: $TITLE"
