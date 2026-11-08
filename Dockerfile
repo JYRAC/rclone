@@ -1,4 +1,4 @@
-FROM rclone/rclone:1.75.2
+FROM rclone/rclone:1.76.0
 
 ARG BAO_VERSION=2.7.2
 RUN apk add --no-cache curl && \
