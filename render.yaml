@@ -15,3 +15,16 @@ services:
        value: "INFO"
      - key: RCLONE_USE_JSON_LOG
        value: "true"
+     # ---- NetBird（OpenBao へ出る＋rclone を NetBird に出す。ピアは固定なので、設定を復元して復帰する）----
+     - key: NB_HOSTNAME
+       value: "rclone"
+     - key: OPENBAO_NB_ADDR
+       value: "https://100.125.124.43:8210"
+     # 初回の登録のときだけ入れて、ピア設定を復元できたら、消す
+     - key: NB_SETUP_KEY
+       sync: false
+     - key: NB_PRINT_CONFIG
+       sync: false
+     # 初回の登録のあと、ログの NB_CONFIG_B64=... の値を入れる（秘密鍵入り）
+     - key: NB_CONFIG_B64
+       sync: false
