@@ -37,17 +37,17 @@ env_template "RCLONE_AUTH_KEY" {
 # OpenBao 向けの BAO_*）を、rclone に渡さないため。渡すと、Google Drive への通信まで、
 # NetBird の SOCKS5 に流れて、失敗する。
 #
-# 待ち受けは2つ。
-#   :10000           公開側（Render の入口）。段階 4 で、S3 を出さない形に変える
-#   127.0.0.1:8210   NetBird 向け。NetBird の転送だけが、ここに届く（TLS なし。WireGuard で暗号化され、
-#                    NetBird の ACL で、届く相手を絞っている）
+# 待ち受けは、NetBird 向けの 127.0.0.1:8210 だけ。NetBird の転送だけが、ここに届く
+# （HTTPS、TLS 1.3。証明書と鍵は、OpenBao の kv/secrets/rclone/config から受け取る。
+# 通信は、WireGuard でも暗号化され、NetBird の ACL で、届く相手を絞っている）。
+# 公開側（Render の入口）は、S3 を出さない（entrypoint.sh が、ポートを開けるだけの待ち受けを置く）。
 exec {
   command = [
     "/usr/bin/env",
     "-u", "HTTPS_PROXY", "-u", "HTTP_PROXY", "-u", "NO_PROXY",
     "-u", "https_proxy", "-u", "http_proxy", "-u", "no_proxy",
     "-u", "BAO_ADDR", "-u", "BAO_CACERT", "-u", "BAO_TLS_SERVER_NAME", "-u", "BAO_CLIENT_TIMEOUT",
-    "/bin/sh", "-c", "exec rclone serve s3 gdrive: --addr \":10000\" --addr \"127.0.0.1:8210\" --poll-interval 0"
+    "/bin/sh", "-c", "exec rclone serve s3 gdrive: --addr \"127.0.0.1:8210\" --cert /tmp/tls/cert.pem --key /tmp/tls/key.pem --min-tls-version tls1.3 --poll-interval 0"
   ]
   restart_on_secret_changes = "always"
 }

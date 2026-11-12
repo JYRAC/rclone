@@ -7,10 +7,36 @@ if [ -z "${OPENBAO_WRAPPED_TOKEN:-}" ]; then
   exit 1
 fi
 
+# 公開側（Render の入口）は、S3 を出さない。ここに置くのは、次の2つだけ（render-ttyd のダミー nginx と、同じ役）。
+#   ・ポートを開けておく（Render が、待ち受けを確認するため。無料プランの、スリープを避けるための、外からの通信の受け口にもなる）
+#   ・/healthz（中身は空）。rclone の S3 が動いていて、NetBird に固定のピアで出ているときだけ、ファイルを置く。
+#     watchdog は、これだけを見る（200 なら健全、404 なら中が壊れている、つながらない、5xx なら、コンテナが落ちている）。
+# S3 は、NetBird 向けの 127.0.0.1:8210 だけで出す（openbao/agent.hcl）。
+s3_alive() {
+  for f in /proc/[0-9]*/cmdline; do
+    tr '\0' ' ' < "$f" 2>/dev/null | grep -q '^rclone serve s3 ' && return 0
+  done
+  return 1
+}
+mkdir -p /tmp/empty
+rclone serve http /tmp/empty --addr ":${PORT:-10000}" >/dev/null 2>&1 &
+(
+  while :; do
+    if [ -e /tmp/nb/stable ] && s3_alive \
+       && NB_DAEMON_ADDR=unix:///tmp/nb/netbird.sock netbird status 2>/dev/null | grep -qi "Management: Connected"; then
+      : > /tmp/empty/healthz
+    else
+      rm -f /tmp/empty/healthz
+    fi
+    sleep 10
+  done
+) &
+
 # 接続先:
 #   OPENBAO_NB_ADDR     OpenBao の NetBird 側の宛先。例 https://100.74.x.y:8210（IP 指定。名前は引けない）
-#   NB_CONFIG_B64       登録済みのピア設定（base64）。IP を固定するため、毎回、これで同じピアに復帰する
-#   NB_SETUP_KEY        初回の登録だけ（使用回数1回、Ephemeral オフ）。復元できたら、環境変数から消す
+#   NB_SETUP_KEY        NetBird の使い捨てキー（Actions がデプロイのたびに作って、Render に渡す）。
+#                       これで、仮のピアとして参加して、OpenBao に出る。固定のピアの設定（IP が変わらない。
+#                       rclone を NetBird に出すのに必要）は、OpenBao の netbird_config_b64 から受け取って、切り替える
 #   OPENBAO_PUBLIC_ADDR 公開側の宛先（移行中の、一時的な代替。段階 4 で、公開側を閉じたら、不要）
 PUBLIC_ADDR="${OPENBAO_PUBLIC_ADDR:-https://openbao.jyrac.stki.org}"
 NB_ADDR="${OPENBAO_NB_ADDR:-}"
@@ -36,15 +62,17 @@ use_netbird() {
   VIA=netbird
 }
 
-if [ -n "$NB_ADDR" ] && { [ -n "${NB_CONFIG_B64:-}" ] || [ -n "${NB_SETUP_KEY:-}" ]; }; then
+NB_OK=0
+if [ -n "$NB_ADDR" ] && [ -n "${NB_SETUP_KEY:-}" ]; then
   if /netbird-up.sh; then
+    NB_OK=1
     use_netbird
   else
     echo "NB: NetBird に接続できませんでした。公開側の OpenBao に接続します（移行中の、一時的な代替）" >&2
   fi
 fi
-# キーと、ピア設定（秘密鍵入り）は、もう使わない。rclone 本体の環境に残さない。
-unset NB_SETUP_KEY NB_CONFIG_B64 NB_PRINT_CONFIG
+# キーは、もう使わない。rclone 本体の環境に残さない。
+unset NB_SETUP_KEY
 [ -n "$VIA" ] || use_public
 
 unwrap() {
@@ -64,6 +92,30 @@ if [ -z "$REAL_TOKEN" ]; then
 fi
 
 printf '%s' "$REAL_TOKEN" > /tmp/vault-token
+
+# S3 を HTTPS（TLS 1.3）で出すための、証明書と秘密鍵（OpenBao から受け取る。unwrap と同じ経路を使う）。
+mkdir -p /tmp/tls
+BAO_TOKEN="$REAL_TOKEN" bao kv get -mount=kv -field=tls_cert_pem secrets/rclone/config > /tmp/tls/cert.pem 2>/tmp/tls.err || true
+BAO_TOKEN="$REAL_TOKEN" bao kv get -mount=kv -field=tls_key_pem secrets/rclone/config > /tmp/tls/key.pem 2>>/tmp/tls.err || true
+if [ ! -s /tmp/tls/cert.pem ] || [ ! -s /tmp/tls/key.pem ]; then
+  echo "OpenBao から tls_cert_pem / tls_key_pem を受け取れません: $(tail -n 2 /tmp/tls.err | tr '\n' ' ')" >&2
+  exit 1
+fi
+chmod 600 /tmp/tls/key.pem
+
+# 固定のピアの設定を、OpenBao から受け取って、一時のピアから切り替える（unwrap と同じ経路を使う）。
+# 受け取れない、または、切り替えに失敗したときは、一時のピアのまま続ける（OpenBao には出られるが、
+# rclone は NetBird に出ない）。
+if [ "$NB_OK" = 1 ]; then
+  NB_CFG=$(BAO_TOKEN="$REAL_TOKEN" bao kv get -mount=kv -field=netbird_config_b64 secrets/rclone/config 2>/tmp/nbcfg.err) || NB_CFG=""
+  if [ -n "$NB_CFG" ]; then
+    NB_CONFIG_B64="$NB_CFG" /netbird-swap.sh || echo "NB: 固定のピアに切り替えられませんでした。rclone は NetBird に出ません" >&2
+  else
+    echo "NB: OpenBao から netbird_config_b64 を受け取れませんでした。rclone は NetBird に出ません: $(tail -n 2 /tmp/nbcfg.err | tr '\n' ' ')" >&2
+  fi
+  unset NB_CFG
+fi
+
 unset REAL_TOKEN OPENBAO_WRAPPED_TOKEN
 
 # Agent の接続設定（vault ブロック）は、経路によって変わるので、ここで作って、agent.hcl の前に付ける。

@@ -28,7 +28,8 @@ COPY openbao/ca.crt /etc/openbao/ca.crt
 COPY openbao/agent.hcl /etc/openbao/agent.hcl
 COPY openbao/entrypoint.sh /entrypoint.sh
 COPY openbao/netbird-up.sh /netbird-up.sh
-RUN sed -i 's/\r$//' /entrypoint.sh /netbird-up.sh && chmod +x /entrypoint.sh /netbird-up.sh
+COPY openbao/netbird-swap.sh /netbird-swap.sh
+RUN sed -i 's/\r$//' /entrypoint.sh /netbird-up.sh /netbird-swap.sh && chmod +x /entrypoint.sh /netbird-up.sh /netbird-swap.sh
 
 EXPOSE 10000
 ENTRYPOINT ["/entrypoint.sh"]

@@ -30,10 +30,54 @@ concurrency:
   group: verify-update
   cancel-in-progress: false
 
+env:
+  RCLONE_NB_IP: "100.125.61.26"   # rclone の NetBird の IP（ポートは 8210、HTTPS）
+
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
+      - name: Connect to NetBird
+        env:
+          NB_SETUP_KEY_ACTIONS: ${{ secrets.NETBIRD_SETUP_KEY_ACTIONS }}
+        run: |
+          set +e
+          NB_VER=0.81.5
+          if [ -z "${NB_SETUP_KEY_ACTIONS:-}" ]; then
+            echo "::warning::NETBIRD_SETUP_KEY_ACTIONS が未設定です"
+            exit 0
+          fi
+          echo "::add-mask::$NB_SETUP_KEY_ACTIONS"
+
+          fail() {
+            echo "::warning::NetBird に接続できませんでした: $1"
+            sudo netbird down >/dev/null 2>&1
+            exit 0
+          }
+
+          curl -fsSL -o /tmp/netbird.tgz \
+            "https://github.com/netbirdio/netbird/releases/download/v${NB_VER}/netbird_${NB_VER}_linux_amd64.tar.gz" || fail "ダウンロード"
+          tar -xzf /tmp/netbird.tgz -C /tmp netbird || fail "展開"
+          sudo install -m 0755 /tmp/netbird /usr/local/bin/netbird
+          sudo netbird service install >/dev/null 2>&1
+          sudo netbird service start || fail "サービスの起動"
+
+          # DNS には触らせない（ランナーの名前解決を変えない）
+          sudo netbird up --setup-key "$NB_SETUP_KEY_ACTIONS" \
+            --hostname "gh-${GITHUB_REPOSITORY##*/}-${GITHUB_RUN_ID}" --disable-dns \
+            > /tmp/nb-up.log 2>&1 || { tail -n 5 /tmp/nb-up.log; fail "netbird up"; }
+
+          # NetBird の管理サーバーに、つながるまで待つ（最大30秒）。rclone への到達は、ここでは問わない
+          # （rclone が落ちているかどうかを、あとの手順で調べるため）。
+          for i in $(seq 1 30); do
+            if sudo netbird status 2>/dev/null | grep -qi "Management: Connected"; then
+              echo "NB_UP=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          fail "管理サーバーに接続できません"
+
       - name: Verify candidate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -46,7 +90,9 @@ jobs:
           set -euo pipefail
           REPO=JYRAC/rclone
           API=https://api.github.com
-          SITE=https://rclone.jyrac.stki.org/
+          # 公開側は閉じているので、NetBird 経由で、rclone（8210）の応答を見る
+          # 応答のコードだけを見る確認なので、証明書は検証しない（curl -k）。通信は、WireGuard の中
+          SITE="https://${RCLONE_NB_IP}:8210/"
           DRY_RUN="${DRY_RUN:-true}"
           H=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
 
@@ -106,6 +152,11 @@ jobs:
             echo "dry run: checks passed, nothing deployed or merged"; exit 0
           fi
 
+          # NetBird に接続できていないと、検証が必ず不合格になって、不要な巻き戻しが起きる。先に止める。
+          if [ "${NB_UP:-}" != "1" ]; then
+            echo "::error::NetBird に接続できないため、検証できません（デプロイも、マージもしません）"; exit 1
+          fi
+
           # --- 3. 候補をデプロイして検証 ---
           BASE=$(gh_api "$API/repos/$REPO/commits/main" | jq -r .sha)
 
@@ -134,7 +185,7 @@ jobs:
           healthy() { # 30秒おきに最大8回、4回連続で 000/5xx 以外なら合格(最大4分)
             local ok=0 i code
             for i in 1 2 3 4 5 6 7 8; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$SITE") || code=000
+              code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "$SITE") || code=000
               if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then ok=$((ok+1)); else ok=0; fi
               echo "health: HTTP $code (consecutive ok: $ok)"
               if [ "$ok" -ge 4 ]; then return 0; fi
@@ -162,3 +213,7 @@ jobs:
           gh_api -X PATCH "$API/repos/$REPO/pulls/$PR" -d '{"state":"closed"}' >/dev/null || true
           echo "::error::update '$TITLE' failed and was rolled back"
           exit 1
+
+      - name: Disconnect NetBird
+        if: always()
+        run: sudo netbird down >/dev/null 2>&1 || true

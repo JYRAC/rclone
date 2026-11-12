@@ -14,12 +14,14 @@ jobs:
       - name: Check health
         id: check
         run: |
+          # S3 は NetBird の中だけ。公開側の /healthz は、rclone の S3 が動いていて、NetBird に固定のピアで
+          # 出ているときだけ 200 になる（404 は、中が壊れている）。この通信は、無料プランのスリープを避ける役も兼ねる。
           CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
-            https://rclone.jyrac.stki.org/) || CODE="000"
+            https://rclone.jyrac.stki.org/healthz) || CODE="000"
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
 
       - name: Trigger redeploy if unhealthy
-        if: steps.check.outputs.code == '000' || (steps.check.outputs.code >= '500' && steps.check.outputs.code < '600')
+        if: steps.check.outputs.code == '000' || steps.check.outputs.code == '404' || (steps.check.outputs.code >= '500' && steps.check.outputs.code < '600')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEPLOY_WORKFLOW: deploy-secrets.yml
