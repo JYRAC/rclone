@@ -44,15 +44,15 @@ jobs:
           set +e
           NB_VER=0.81.5
           if [ -z "${NB_SETUP_KEY_ACTIONS:-}" ]; then
-            echo "::warning::NETBIRD_SETUP_KEY_ACTIONS が未設定です"
-            exit 0
+            echo "::error::NETBIRD_SETUP_KEY_ACTIONS が未設定です"
+            exit 1
           fi
           echo "::add-mask::$NB_SETUP_KEY_ACTIONS"
 
           fail() {
-            echo "::warning::NetBird に接続できませんでした: $1"
+            echo "::error::NetBird に接続できませんでした: $1"
             sudo netbird down >/dev/null 2>&1
-            exit 0
+            exit 1
           }
 
           curl -fsSL -o /tmp/netbird.tgz \
