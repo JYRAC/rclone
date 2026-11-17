@@ -118,7 +118,7 @@ jobs:
           TITLE=$(jq -r .title <<<"$PRJ")
           echo "candidate: #$PR $TITLE ($HEAD)"
 
-          # --- 2. 安全確認: Renovate本人の、同一リポジトリのブランチで、Dockerfileの FROM / ARG BAO_VERSION 行だけの変更 ---
+          # --- 2. 安全確認: Renovate本人の、同一リポジトリのブランチで、Dockerfileの FROM / ARG BAO_VERSION / ARG NETBIRD_VERSION 行だけの変更 ---
           if [ "$AUTHOR" != "renovate[bot]" ] || [ "$HEADREPO" != "$REPO" ]; then
             echo "::error::PR #$PR is not from renovate[bot] in this repo; refusing"; exit 1
           fi
@@ -128,9 +128,9 @@ jobs:
           fi
           BAD=$(jq -r '.[0].patch // ""' <<<"$FILES" \
             | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' \
-            | grep -vE '^[+-](FROM |ARG BAO_VERSION=)' || true)
+            | grep -vE '^[+-](FROM |ARG BAO_VERSION=|ARG NETBIRD_VERSION=)' || true)
           if [ -n "$BAD" ]; then
-            echo "::error::PR #$PR changes lines other than FROM / ARG BAO_VERSION; refusing"; exit 1
+            echo "::error::PR #$PR changes lines other than FROM / ARG BAO_VERSION / ARG NETBIRD_VERSION; refusing"; exit 1
           fi
 
           # --- 2b. mainに追いついているか(古い土台のままデプロイしない。追いついていなければ、Renovateのrebaseを待つ) ---
