@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Check health
         id: check
+        env:
+          RENEW_DAYS: "30"   # S3 の証明書が、この日数を切ったら、再デプロイして、新しく発行させる
         run: |
           # S3 は NetBird の中だけ。公開側の /healthz は、rclone の S3 が動いていて、NetBird に固定のピアで
           # 出ているときだけ 200 になる（404 は、中が壊れている）。この通信は、無料プランのスリープを避ける役も兼ねる。
@@ -20,14 +22,47 @@ jobs:
             https://rclone.jyrac.stki.org/healthz) || CODE="000"
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
 
-      - name: Trigger redeploy if unhealthy
-        if: steps.check.outputs.code == '000' || steps.check.outputs.code == '404' || (steps.check.outputs.code >= '500' && steps.check.outputs.code < '600')
+          # 200 のとき、S3 の証明書の出どころと期限が、/cert-info に入る（起動時に、entrypoint.sh が書く。秘密ではない）。
+          SRC=""; EXP=""; DAYS=""; RENEW="false"
+          if [ "$CODE" = "200" ]; then
+            INFO=$(curl -sf --max-time 10 https://rclone.jyrac.stki.org/cert-info || true)
+            SRC=$(printf '%s\n' "$INFO" | sed -n 's/^source=//p' | tr -d '\r' | head -n 1)
+            EXP=$(printf '%s\n' "$INFO" | sed -n 's/^not_after=//p' | tr -d '\r' | head -n 1)
+          fi
+          if [ -n "$EXP" ] && EXP_S=$(date -d "$EXP" +%s 2>/dev/null); then
+            DAYS=$(( (EXP_S - $(date +%s)) / 86400 ))
+            echo "S3 cert: expires=$EXP source=${SRC:-unknown} days_left=$DAYS"
+            if [ "$DAYS" -lt "$RENEW_DAYS" ]; then RENEW="true"; fi
+          fi
+          echo "renew=$RENEW" >> "$GITHUB_OUTPUT"
+          echo "days=$DAYS" >> "$GITHUB_OUTPUT"
+          echo "source=${SRC:-unknown}" >> "$GITHUB_OUTPUT"
+
+          # PKI から発行できず、kv の自己署名に戻っているときは、期限の残りが多くても、毎回、警告を出す。
+          if [ "$CODE" = "200" ] && [ -n "$SRC" ] && [ "$SRC" != "pki" ]; then
+            echo "::warning::S3 cert source=${SRC} (PKI の発行に失敗して、kv の自己署名に戻っています。デプロイのログの TLS_CERT_SOURCE を確認)"
+          fi
+
+      - name: Trigger redeploy if unhealthy or the S3 cert is expiring
+        if: steps.check.outputs.code == '000' || steps.check.outputs.code == '404' || (steps.check.outputs.code >= '500' && steps.check.outputs.code < '600') || steps.check.outputs.renew == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEPLOY_WORKFLOW: deploy-secrets.yml
         run: |
           CODE="${{ steps.check.outputs.code }}"
+          RENEW="${{ steps.check.outputs.renew }}"
+          DAYS="${{ steps.check.outputs.days }}"
+          SRC="${{ steps.check.outputs.source }}"
           API="https://api.github.com/repos/JYRAC/rclone/actions/workflows/${DEPLOY_WORKFLOW}"
+
+          # 落ちているとき: 900 秒以内に、デプロイしていたら、起動しない（デプロイの連発を避ける）。
+          # 証明書の更新だけのとき: 1 日以内に、デプロイしていたら、起動しない
+          # （新しく発行しても、期限が延びない場合に、毎分のデプロイにならないように）。
+          if [ "$RENEW" = "true" ] && [ "$CODE" = "200" ]; then
+            MIN_AGE=86400
+          else
+            MIN_AGE=900
+          fi
 
           LAST=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -39,9 +74,13 @@ jobs:
             AGE=$(( $(date +%s) - $(date -d "$LAST" +%s) ))
           fi
 
-          if [ "$AGE" -lt 900 ]; then
-            echo "::error::rclone returned HTTP $CODE, but the last deploy ran ${AGE}s ago (<900s). Skipping redeploy to avoid a deploy storm."
-            exit 1
+          if [ "$AGE" -lt "$MIN_AGE" ]; then
+            if [ "$MIN_AGE" = "900" ]; then
+              echo "::error::rclone returned HTTP $CODE, but the last deploy ran ${AGE}s ago (<900s). Skipping redeploy to avoid a deploy storm."
+              exit 1
+            fi
+            echo "::warning::S3 cert has ${DAYS} days left (source=${SRC}), but the last deploy ran ${AGE}s ago (<${MIN_AGE}s). Skipping redeploy."
+            exit 0
           fi
 
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
@@ -55,5 +94,12 @@ jobs:
             exit 1
           fi
 
-          echo "::error::rclone returned HTTP $CODE - triggered redeploy, please check why it went down"
-          exit 1
+          if [ "$CODE" != "200" ]; then
+            echo "::error::rclone returned HTTP $CODE - triggered redeploy, please check why it went down"
+            exit 1
+          fi
+          # 新しく発行しても、期限が延びない（出どころが pki 以外。PKI から発行できていない）ときは、気づけるようにする
+          if [ "$SRC" != "pki" ]; then
+            echo "::warning::S3 cert has ${DAYS} days left and source=${SRC}: a redeploy will not extend it unless PKI issuance works (check TLS_CERT_SOURCE in the logs)."
+          fi
+          echo "::notice::S3 cert has ${DAYS} days left (source=${SRC}) - triggered redeploy to renew it"

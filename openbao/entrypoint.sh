@@ -93,15 +93,69 @@ fi
 
 printf '%s' "$REAL_TOKEN" > /tmp/vault-token
 
-# S3 を HTTPS（TLS 1.3）で出すための、証明書と秘密鍵（OpenBao から受け取る。unwrap と同じ経路を使う）。
-mkdir -p /tmp/tls
+# Agent の接続設定（vault ブロック）は、経路によって変わるので、ここで作る。
+# 証明書の1回発行（下）と、常駐の Agent（最後）の、両方が使う。
+{
+  echo 'vault {'
+  echo "  address = \"$BAO_ADDR\""
+  if [ "$VIA" = "netbird" ]; then
+    echo '  ca_cert         = "/etc/openbao/ca.crt"'
+    echo "  tls_server_name = \"$NB_SNI\""
+  fi
+  echo '}'
+  echo
+} > /tmp/vault.hcl
+
+# S3 を HTTPS（TLS 1.3）で出すための、証明書と秘密鍵。
+#   1. OpenBao の PKI（pki_int）から、起動のたびに、1回、発行する（openbao/cert-once.hcl。秘密鍵は、OpenBao に保存されない）。
+#   2. 発行できなかったとき（PKI の不調、ポリシーなし、時間切れ）は、これまでの、kv の自己署名（tls_cert_pem / tls_key_pem）に戻る。
+# どちらを使ったかは、ログの TLS_CERT_SOURCE=pki | kv-fallback で分かる。
+# 1回発行の Agent は、失敗すると終わらずにリトライし続けるので、timeout で打ち切り、
+# 成否は、終了コードではなく、ファイル（bundle.pem と key.pem）が、両方あるかで判断する。
+mkdir -p /tmp/tls/pki
+rm -f /tmp/tls/pki/bundle.pem /tmp/tls/pki/key.pem /tmp/tls/cert.pem /tmp/tls/key.pem
+
+# 戻り先の kv の証明書は、先に受け取っておく（受け取れなくても、ここでは止めない）
 BAO_TOKEN="$REAL_TOKEN" bao kv get -mount=kv -field=tls_cert_pem secrets/rclone/config > /tmp/tls/cert.pem 2>/tmp/tls.err || true
 BAO_TOKEN="$REAL_TOKEN" bao kv get -mount=kv -field=tls_key_pem secrets/rclone/config > /tmp/tls/key.pem 2>>/tmp/tls.err || true
-if [ ! -s /tmp/tls/cert.pem ] || [ ! -s /tmp/tls/key.pem ]; then
-  echo "OpenBao から tls_cert_pem / tls_key_pem を受け取れません: $(tail -n 2 /tmp/tls.err | tr '\n' ' ')" >&2
+
+# 発行に失敗した理由を、ログから拾う（Agent の最後の行は、終了のメッセージだけなので、エラーの行を探す）
+cert_once_why() {
+  { grep -i -E 'error|denied|permission|refused|no such host|timeout' /tmp/cert-once.log || tail -n 3 /tmp/cert-once.log; } 2>/dev/null | tail -n 2 | tr '\n' ' '
+}
+
+if command -v timeout >/dev/null 2>&1; then
+  cat /tmp/vault.hcl /etc/openbao/cert-once.hcl > /tmp/cert-once.hcl
+  timeout 60 bao agent -config=/tmp/cert-once.hcl -exit-after-auth >/tmp/cert-once.log 2>&1 || true
+else
+  echo "TLS: timeout コマンドがありません。PKI からは発行せず、kv の自己署名を使います" >/tmp/cert-once.log
+fi
+
+if [ -s /tmp/tls/pki/bundle.pem ] && [ -s /tmp/tls/pki/key.pem ]; then
+  cp /tmp/tls/pki/bundle.pem /tmp/tls/cert.pem
+  cp /tmp/tls/pki/key.pem /tmp/tls/key.pem
+  TLS_SRC=pki
+elif [ -s /tmp/tls/cert.pem ] && [ -s /tmp/tls/key.pem ]; then
+  TLS_SRC=kv-fallback
+  echo "TLS: PKI から発行できませんでした。kv の自己署名を使います: $(cert_once_why)" >&2
+else
+  echo "TLS: PKI からも kv からも、証明書を受け取れません: $(cert_once_why) / $(tail -n 2 /tmp/tls.err | tr '\n' ' ')" >&2
   exit 1
 fi
 chmod 600 /tmp/tls/key.pem
+rm -f /tmp/tls/pki/bundle.pem /tmp/tls/pki/key.pem /tmp/cert-once.hcl /tmp/cert-once.log
+echo "TLS_CERT_SOURCE=$TLS_SRC"
+
+# 証明書の期限と出どころを、公開側の /cert-info に出す（秘密ではない）。watchdog が、これを見て、
+#   ・残りが 30 日を切ったら、再デプロイを起動して、新しく発行させる
+#   ・出どころが pki 以外（kv-fallback）なら、警告を出す
+if command -v openssl >/dev/null 2>&1; then
+  NOT_AFTER=$(openssl x509 -in /tmp/tls/cert.pem -noout -enddate 2>/dev/null | sed 's/^notAfter=//') || NOT_AFTER=""
+  if [ -n "$NOT_AFTER" ]; then
+    printf 'source=%s\nnot_after=%s\n' "$TLS_SRC" "$NOT_AFTER" > /tmp/empty/cert-info
+    echo "TLS_CERT_INFO source=$TLS_SRC not_after=$NOT_AFTER"
+  fi
+fi
 
 # 固定のピアの設定を、OpenBao から受け取って、一時のピアから切り替える（unwrap と同じ経路を使う）。
 # 受け取れない、または、切り替えに失敗したときは、一時のピアのまま続ける（OpenBao には出られるが、
@@ -118,18 +172,8 @@ fi
 
 unset REAL_TOKEN OPENBAO_WRAPPED_TOKEN
 
-# Agent の接続設定（vault ブロック）は、経路によって変わるので、ここで作って、agent.hcl の前に付ける。
-{
-  echo 'vault {'
-  echo "  address = \"$BAO_ADDR\""
-  if [ "$VIA" = "netbird" ]; then
-    echo '  ca_cert         = "/etc/openbao/ca.crt"'
-    echo "  tls_server_name = \"$NB_SNI\""
-  fi
-  echo '}'
-  echo
-  cat /etc/openbao/agent.hcl
-} > /tmp/agent.hcl
+# 常駐の Agent の設定は、vault ブロック（上で作った /tmp/vault.hcl）の後に、agent.hcl を続ける。
+cat /tmp/vault.hcl /etc/openbao/agent.hcl > /tmp/agent.hcl
 
 echo "OPENBAO_VIA=$VIA addr=$BAO_ADDR"
 exec bao agent -config=/tmp/agent.hcl

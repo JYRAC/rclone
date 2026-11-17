@@ -10,7 +10,8 @@ RUN apk add --no-cache curl && \
 FROM rclone/rclone:1.76.0
 
 ARG BAO_VERSION=2.7.2
-RUN apk add --no-cache curl && \
+# openssl は、証明書の期限を、公開側の /cert-info に出すために使う（無くても動く）
+RUN apk add --no-cache curl openssl && \
     curl -fsSL -o /tmp/bao.tar.gz \
       "https://github.com/openbao/openbao/releases/download/v${BAO_VERSION}/openbao_${BAO_VERSION}_linux_amd64.tar.gz" && \
     mkdir -p /tmp/bao-extract && \
@@ -26,6 +27,7 @@ RUN chmod +x /usr/local/bin/netbird && /usr/local/bin/netbird version
 # OpenBao の NetBird 向け証明書
 COPY openbao/ca.crt /etc/openbao/ca.crt
 COPY openbao/agent.hcl /etc/openbao/agent.hcl
+COPY openbao/cert-once.hcl /etc/openbao/cert-once.hcl
 COPY openbao/entrypoint.sh /entrypoint.sh
 COPY openbao/netbird-up.sh /netbird-up.sh
 COPY openbao/netbird-swap.sh /netbird-swap.sh

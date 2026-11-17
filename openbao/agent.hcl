@@ -38,7 +38,8 @@ env_template "RCLONE_AUTH_KEY" {
 # NetBird の SOCKS5 に流れて、失敗する。
 #
 # 待ち受けは、NetBird 向けの 127.0.0.1:8210 だけ。NetBird の転送だけが、ここに届く
-# （HTTPS、TLS 1.3。証明書と鍵は、OpenBao の kv/secrets/rclone/config から受け取る。
+# （HTTPS、TLS 1.3。証明書と鍵は、entrypoint.sh が /tmp/tls/cert.pem と key.pem に置く。
+# 起動時に、OpenBao の PKI から発行する。発行できなければ、kv/secrets/rclone/config の自己署名。
 # 通信は、WireGuard でも暗号化され、NetBird の ACL で、届く相手を絞っている）。
 # 公開側（Render の入口）は、S3 を出さない（entrypoint.sh が、ポートを開けるだけの待ち受けを置く）。
 exec {
