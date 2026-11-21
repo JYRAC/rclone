@@ -9,7 +9,7 @@ RUN apk add --no-cache curl && \
 
 FROM rclone/rclone:1.76.0
 
-ARG BAO_VERSION=2.7.2
+ARG BAO_VERSION=2.7.3
 # openssl は、証明書の期限を、公開側の /cert-info に出すために使う（無くても動く）
 RUN apk add --no-cache curl openssl && \
     curl -fsSL -o /tmp/bao.tar.gz \
